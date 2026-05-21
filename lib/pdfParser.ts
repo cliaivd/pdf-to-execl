@@ -1,10 +1,21 @@
 import * as XLSX from "xlsx";
 
+let workerConfigured = false;
+
+async function ensureWorker() {
+  if (workerConfigured || typeof window === "undefined") return;
+  const pdfjsLib = await import("pdfjs-dist");
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdn.jsdelivr.net/npm/pdfjs-dist@5.7.284/build/pdf.worker.min.mjs";
+  workerConfigured = true;
+}
+
 /**
  * Extract text content from PDF using pdfjs-dist.
  * Run in browser context only.
  */
 export async function extractPdfText(file: File): Promise<string> {
+  await ensureWorker();
   const { getDocument } = await import("pdfjs-dist");
 
   const buffer = await file.arrayBuffer();
@@ -45,8 +56,7 @@ export function parseTextToRows(text: string): string[][] {
   if (commaCount > tabCount && commaCount > pipeCount) delimiter = ",";
   if (pipeCount > tabCount && pipeCount > commaCount) delimiter = "|";
   // Default to splitting by whitespace if no clear delimiter
-  const totalDelim =
-    tabCount + commaCount + pipeCount;
+  const totalDelim = tabCount + commaCount + pipeCount;
   if (totalDelim < lines.length * 0.5) {
     // Likely space-separated or plain block text — split by 2+ spaces or single space
     return lines.map((l) =>
