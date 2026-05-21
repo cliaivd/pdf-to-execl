@@ -10,9 +10,16 @@ async function ensureWorker() {
   workerConfigured = true;
 }
 
+interface TextItem {
+  str: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 /**
- * Extract text content from PDF using pdfjs-dist.
- * Run in browser context only.
+ * Extract text from PDF preserving positional info for table reconstruction.
  */
 export async function extractPdfText(file: File): Promise<string> {
   await ensureWorker();
@@ -24,19 +31,64 @@ export async function extractPdfText(file: File): Promise<string> {
   let fullText = "";
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
+    const viewport = page.getViewport({ scale: 1 });
     const content = await page.getTextContent();
-    const pageText = content.items
-      .map((item: any) => item.str)
-      .join(" ");
-    fullText += pageText + "\n\n";
+
+    // Collect items with positions
+    const items: TextItem[] = content.items.map((item: any) => ({
+      str: item.str,
+      x: item.transform[4],
+      y: viewport.height - item.transform[5], // flip y for intuitive top→bottom
+      width: item.width,
+      height: item.height,
+    }));
+
+    if (items.length === 0) continue;
+
+    // Group items by row (same Y within a tolerance)
+    const tolerance = items[0].height * 0.5 || 3;
+    const rows: TextItem[][] = [];
+    let currentRow: TextItem[] = [items[0]];
+
+    for (let j = 1; j < items.length; j++) {
+      const prev = items[j - 1];
+      const curr = items[j];
+      if (Math.abs(curr.y - prev.y) < tolerance) {
+        currentRow.push(curr);
+      } else {
+        // Sort current row by X, then add as text line
+        currentRow.sort((a, b) => a.x - b.x);
+        rows.push(currentRow);
+        currentRow = [curr];
+      }
+    }
+    currentRow.sort((a, b) => a.x - b.x);
+    rows.push(currentRow);
+
+    // Detect natural gaps between columns (heuristic: gap > 2x average char width)
+    for (const row of rows) {
+      if (row.length === 0) continue;
+      const gaps: string[] = [row[0].str];
+      for (let j = 1; j < row.length; j++) {
+        const gap = row[j].x - (row[j - 1].x + row[j - 1].width);
+        // If gap is large enough, insert tab as column separator
+        // Average char width estimate
+        const avgCharWidth =
+          row[j - 1].width / Math.max(row[j - 1].str.length, 1);
+        if (gap > avgCharWidth * 3) {
+          gaps.push("\t");
+        }
+        gaps.push(row[j].str);
+      }
+      fullText += gaps.join("") + "\n";
+    }
   }
 
   return fullText.trim();
 }
 
 /**
- * Parse text into a 2D array, splitting on newlines and tabs/commas.
- * Auto-detects delimiter.
+ * Parse text into a 2D array.
  */
 export function parseTextToRows(text: string): string[][] {
   const lines = text
@@ -44,24 +96,23 @@ export function parseTextToRows(text: string): string[][] {
     .map((l) => l.trim())
     .filter((l) => l.length > 0);
 
-  // Heuristic: detect delimiter by counting occurrences
+  // Detect delimiter: tab > comma > pipe
   const tabCount = lines.reduce((s, l) => s + (l.match(/\t/g) || []).length, 0);
   const commaCount = lines.reduce(
     (s, l) => s + (l.match(/,/g) || []).length,
     0
   );
-  const pipeCount = lines.reduce((s, l) => s + (l.match(/\|/g) || []).length, 0);
+  const pipeCount = lines.reduce(
+    (s, l) => s + (l.match(/\|/g) || []).length,
+    0
+  );
 
-  let delimiter: string = "\t";
+  let delimiter = "\t";
   if (commaCount > tabCount && commaCount > pipeCount) delimiter = ",";
   if (pipeCount > tabCount && pipeCount > commaCount) delimiter = "|";
-  // Default to splitting by whitespace if no clear delimiter
-  const totalDelim = tabCount + commaCount + pipeCount;
-  if (totalDelim < lines.length * 0.5) {
-    // Likely space-separated or plain block text — split by 2+ spaces or single space
-    return lines.map((l) =>
-      l.split(/\s{2,}|\t/).map((c) => c.trim())
-    );
+
+  if (delimiter === "\t") {
+    return lines.map((l) => l.split("\t").map((c) => c.trim()));
   }
 
   return lines.map((l) => l.split(delimiter).map((c) => c.trim()));
