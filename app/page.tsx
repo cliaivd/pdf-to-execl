@@ -1,27 +1,39 @@
 "use client";
 
-import { useCallback, useState, useRef } from "react";
-import { extractPdfText, parseTextToRows, exportToExcel } from "@/lib/pdfParser";
+import { useState, useRef, useCallback } from "react";
+import { pdfToImages } from "@/lib/pdfToImage";
+import { exportToExcel } from "@/lib/excelExport";
 
 interface PdfFile {
   name: string;
-  size: number;
   file: File;
+  size: number;
 }
 
-type Step = "upload" | "processing" | "preview" | "done";
+interface ParseResult {
+  page: number;
+  columns: string[];
+  rows: string[][];
+  raw: string;
+}
+
+type Step = "upload" | "config" | "processing" | "preview" | "done";
 
 export default function Home() {
   const [files, setFiles] = useState<PdfFile[]>([]);
   const [dragging, setDragging] = useState(false);
   const [step, setStep] = useState<Step>("upload");
-  const [currentFile, setCurrentFile] = useState<string>("");
+  const [instruction, setInstruction] = useState(
+    "请提取发票中的以下字段：公司名称、开票日期、发票号码、金额（含税）、税额、购方名称"
+  );
+  const [editingInstruction, setEditingInstruction] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [tableData, setTableData] = useState<string[][]>([]);
-  const [editingData, setEditingData] = useState<string[][]>([]);
+  const [statusText, setStatusText] = useState("");
+  const [results, setResults] = useState<ParseResult[]>([]);
+  const [editingColumns, setEditingColumns] = useState<string[]>([]);
+  const [editingRows, setEditingRows] = useState<string[][]>([]);
   const [editingCell, setEditingCell] = useState<{ r: number; c: number } | null>(null);
   const [error, setError] = useState("");
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const addFiles = useCallback((fileList: FileList | File[]) => {
     const pdfs = Array.from(fileList).filter(
@@ -29,19 +41,17 @@ export default function Home() {
     );
     setFiles((prev) => [
       ...prev,
-      ...pdfs.map((f) => ({ name: f.name, size: f.size, file: f })),
+      ...pdfs.map((f) => ({ name: f.name, file: f, size: f.size })),
     ]);
     setError("");
+    setStep("upload");
   }, []);
 
-  const handleDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      setDragging(false);
-      addFiles(e.dataTransfer.files);
-    },
-    [addFiles]
-  );
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragging(false);
+    addFiles(e.dataTransfer.files);
+  };
 
   const handleClick = () => {
     const input = document.createElement("input");
@@ -58,49 +68,112 @@ export default function Home() {
     setFiles((prev) => prev.filter((_, i) => i !== index));
   };
 
-  const handleProcess = async () => {
+  const handleStartParse = async () => {
     if (files.length === 0) return;
     setStep("processing");
     setError("");
+    setResults([]);
 
     try {
       for (let i = 0; i < files.length; i++) {
         const f = files[i];
-        setCurrentFile(f.name);
-        setProgress(Math.round(((i) / files.length) * 100));
+        setStatusText(`Converting: ${f.name}`);
+        setProgress(Math.round((i / files.length) * 100));
 
-        const text = await extractPdfText(f.file);
-        const rows = parseTextToRows(text);
+        // Step 1: PDF → images
+        const { pages } = await pdfToImages(f.file);
 
-        if (i === 0) {
-          setTableData(rows);
-          setEditingData(rows.map((r) => [...r]));
-        } else {
-          // For multiple files, keep appending
-          setTableData((prev) => [...prev, ...rows]);
-          setEditingData((prev) => [...prev, ...rows.map((r) => [...r])]);
+        setStatusText(`AI analyzing: ${f.name}`);
+        setProgress(
+          Math.round(((i + 0.5) / files.length) * 100)
+        );
+
+        // Step 2: Send to AI via API
+        const res = await fetch("/api/parse-pdf", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            images: pages,
+            instruction:
+              instruction ||
+              "Extract all tabular data from this document.",
+          }),
+        });
+
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || "API error");
         }
 
-        setProgress(Math.round(((i + 1) / files.length) * 100));
+        const data = await res.json();
+        setResults((prev) => [...prev, ...data.results]);
       }
+
+      // Combine all results
+      const allColumns =
+        results.length > 0
+          ? results[0].columns
+          : ([] as string[]);
+      const allRows = results.flatMap((r) => r.rows);
+
+      // Also add newly fetched results
+      const freshColumns =
+        results.length > 0
+          ? [...results[0].columns]
+          : [];
+      const freshRows = results.flatMap((r) => r.rows);
+
+      // Re-fetch from the state after all processing
+      // (useEffect-like recalculation)
+      setEditingColumns(freshColumns);
+      setEditingRows(freshRows);
+      setProgress(100);
+      setStatusText("Done!");
       setStep("preview");
     } catch (err: any) {
-      setError(err?.message || "Failed to parse PDF");
-      setStep("upload");
+      setError(err?.message || "Something went wrong");
+      setStep("config");
     }
   };
+
+  // Process results after state is set
+  // Use a ref to track if we should combine results
+  const processResults = useCallback((allResults: ParseResult[]) => {
+    if (allResults.length === 0) return;
+    const cols = allResults[0].columns || [];
+    const rows = allResults.flatMap((r) => r.rows || []);
+    setEditingColumns(cols);
+    setEditingRows(rows);
+    setStep("preview");
+  }, []);
+
+  // Watch results changes
+  const prevResultsLength = useRef(0);
+  if (results.length > 0 && results.length !== prevResultsLength.current) {
+    prevResultsLength.current = results.length;
+    // Only trigger when we finish all files
+    if (step === "processing") {
+      const cols = results[0].columns || [];
+      const rows = results.flatMap((r) => r.rows || []);
+      setEditingColumns(cols);
+      setEditingRows(rows);
+      setProgress(100);
+      setStatusText("Done!");
+      setTimeout(() => setStep("preview"), 300);
+    }
+  }
 
   const handleExport = () => {
     const name =
       files.length === 1
         ? files[0].name.replace(/\.pdf$/i, "") + ".xlsx"
         : "combined.xlsx";
-    exportToExcel(editingData, name);
+    exportToExcel(editingColumns, editingRows, name);
     setStep("done");
   };
 
   const updateCell = (r: number, c: number, value: string) => {
-    setEditingData((prev) => {
+    setEditingRows((prev) => {
       const next = prev.map((row) => [...row]);
       next[r][c] = value;
       return next;
@@ -108,30 +181,41 @@ export default function Home() {
   };
 
   const addRow = () => {
-    const cols = editingData[0]?.length || 1;
-    setEditingData((prev) => [...prev, Array(cols).fill("")]);
+    const cols = editingColumns.length || 1;
+    setEditingRows((prev) => [...prev, Array(cols).fill("")]);
   };
 
   const removeRow = (r: number) => {
-    setEditingData((prev) => prev.filter((_, i) => i !== r));
+    setEditingRows((prev) => prev.filter((_, i) => i !== r));
   };
 
   const addColumn = () => {
-    setEditingData((prev) => prev.map((row) => [...row, ""]));
+    setEditingColumns((prev) => [...prev, `Col ${prev.length + 1}`]);
+    setEditingRows((prev) => prev.map((row) => [...row, ""]));
   };
 
   const removeColumn = (c: number) => {
-    setEditingData((prev) => prev.map((row) => row.filter((_, i) => i !== c)));
+    setEditingColumns((prev) => prev.filter((_, i) => i !== c));
+    setEditingRows((prev) => prev.map((row) => row.filter((_, i) => i !== c)));
+  };
+
+  const updateColumnName = (c: number, name: string) => {
+    setEditingColumns((prev) => {
+      const next = [...prev];
+      next[c] = name;
+      return next;
+    });
   };
 
   const reset = () => {
     setFiles([]);
     setStep("upload");
-    setCurrentFile("");
     setProgress(0);
-    setTableData([]);
-    setEditingData([]);
+    setResults([]);
+    setEditingColumns([]);
+    setEditingRows([]);
     setError("");
+    prevResultsLength.current = 0;
   };
 
   const formatSize = (bytes: number) => {
@@ -142,15 +226,17 @@ export default function Home() {
 
   return (
     <main className="flex min-h-screen flex-col items-center bg-gray-50 p-4">
-      <div className="w-full max-w-4xl">
+      <div className="w-full max-w-5xl">
         <header className="mb-8 text-center">
           <h1 className="text-3xl font-bold text-gray-800">PDF → Excel</h1>
           <p className="mt-1 text-sm text-gray-500">
-            Upload PDFs, extract tables, edit, and export to Excel
+            Upload PDF &rarr; AI extracts data &rarr; Edit &rarr; Export to
+            Excel
           </p>
         </header>
 
-        {step === "upload" && (
+        {/* Step 1: Upload */}
+        {(step === "upload" || step === "config") && (
           <>
             <div
               onDrop={handleDrop}
@@ -190,83 +276,166 @@ export default function Home() {
             </div>
 
             {files.length > 0 && (
-              <>
-                <ul className="mt-6 space-y-2">
-                  {files.map((file, i) => (
-                    <li
-                      key={`${file.name}-${i}`}
-                      className="flex items-center justify-between rounded-lg bg-white px-4 py-3 shadow-sm"
-                    >
-                      <div className="flex items-center gap-3 truncate">
-                        <svg
-                          className="h-5 w-5 shrink-0 text-red-400"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth={1.5}
-                            d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"
-                          />
-                        </svg>
-                        <span className="truncate text-sm text-gray-700">
-                          {file.name}
-                        </span>
-                        <span className="shrink-0 text-xs text-gray-400">
-                          {formatSize(file.size)}
-                        </span>
-                      </div>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          removeFile(i);
-                        }}
-                        className="ml-2 shrink-0 text-gray-400 hover:text-red-500"
-                        aria-label="Remove file"
+              <ul className="mt-6 space-y-2">
+                {files.map((file, i) => (
+                  <li
+                    key={`${file.name}-${i}`}
+                    className="flex items-center justify-between rounded-lg bg-white px-4 py-3 shadow-sm"
+                  >
+                    <div className="flex items-center gap-3 truncate">
+                      <svg
+                        className="h-5 w-5 shrink-0 text-red-400"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
                       >
-                        <svg
-                          className="h-4 w-4"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth={2}
-                            d="M6 18L18 6M6 6l12 12"
-                          />
-                        </svg>
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-
-                <button
-                  onClick={handleProcess}
-                  className="mt-6 w-full rounded-lg bg-blue-600 px-6 py-3 text-sm font-semibold text-white shadow transition hover:bg-blue-700"
-                >
-                  Process {files.length} file{files.length > 1 ? "s" : ""}
-                </button>
-              </>
-            )}
-
-            {error && (
-              <div className="mt-4 rounded-lg bg-red-50 px-4 py-3 text-sm text-red-600">
-                {error}
-              </div>
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={1.5}
+                          d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"
+                        />
+                      </svg>
+                      <span className="truncate text-sm text-gray-700">
+                        {file.name}
+                      </span>
+                      <span className="shrink-0 text-xs text-gray-400">
+                        {formatSize(file.size)}
+                      </span>
+                    </div>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        removeFile(i);
+                      }}
+                      className="ml-2 shrink-0 text-gray-400 hover:text-red-500"
+                      aria-label="Remove file"
+                    >
+                      <svg
+                        className="h-4 w-4"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M6 18L18 6M6 6l12 12"
+                        />
+                      </svg>
+                    </button>
+                  </li>
+                ))}
+              </ul>
             )}
           </>
         )}
 
+        {/* Step 2: Configure extraction */}
+        {(step === "config" || (files.length > 0 && step === "upload")) &&
+          files.length > 0 && (
+            <div className="mt-6 rounded-xl border border-gray-200 bg-white p-6 shadow-sm">
+              <h2 className="mb-3 text-sm font-semibold text-gray-700">
+                Extraction Instructions
+              </h2>
+              <p className="mb-2 text-xs text-gray-400">
+                Tell the AI what data to extract. Be specific about fields and
+                format.
+              </p>
+
+              {editingInstruction ? (
+                <textarea
+                  autoFocus
+                  className="w-full rounded-lg border border-gray-300 p-3 text-sm"
+                  rows={4}
+                  value={instruction}
+                  onChange={(e) => setInstruction(e.target.value)}
+                  onBlur={() => setEditingInstruction(false)}
+                />
+              ) : (
+                <div
+                  className="cursor-pointer rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm text-gray-600 hover:border-gray-300"
+                  onClick={() => setEditingInstruction(true)}
+                >
+                  {instruction || (
+                    <span className="italic text-gray-400">
+                      Click to enter instructions...
+                    </span>
+                  )}
+                  <svg
+                    className="ml-2 inline-block h-3 w-3 text-gray-400"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"
+                    />
+                  </svg>
+                </div>
+              )}
+
+              <div className="mt-4 flex gap-2">
+                <button
+                  onClick={() => setInstruction("")}
+                  className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-50"
+                >
+                  Clear
+                </button>
+
+                <button
+                  onClick={() =>
+                    setInstruction(
+                      "请提取发票中的以下字段：公司名称、开票日期、发票号码、金额（含税）、税额、购方名称"
+                    )
+                  }
+                  className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-50"
+                >
+                  Invoice template
+                </button>
+
+                <button
+                  onClick={() =>
+                    setInstruction(
+                      "请提取表格中的所有数据，保留所有列和行"
+                    )
+                  }
+                  className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-50"
+                >
+                  Table template
+                </button>
+
+                <button
+                  onClick={() => setStep("config")}
+                  className="ml-auto rounded-lg bg-blue-600 px-6 py-2 text-sm font-semibold text-white shadow transition hover:bg-blue-700"
+                >
+                  Start Extraction
+                </button>
+              </div>
+            </div>
+          )}
+
+        {/* Hidden start button inside config */}
+        {step === "config" && (
+          <div className="mt-4 text-center">
+            <button
+              onClick={handleStartParse}
+              className="rounded-lg bg-blue-600 px-8 py-3 text-base font-semibold text-white shadow transition hover:bg-blue-700"
+            >
+              Start AI Extraction
+            </button>
+          </div>
+        )}
+
+        {/* Step 3: Processing */}
         {step === "processing" && (
           <div className="flex flex-col items-center justify-center rounded-xl bg-white p-12 shadow-sm">
             <div className="mb-4 h-8 w-8 animate-spin rounded-full border-4 border-blue-200 border-t-blue-600" />
-            <p className="text-sm text-gray-600">
-              Processing: {currentFile}
-            </p>
+            <p className="text-sm text-gray-600">{statusText}</p>
             <div className="mt-4 h-2 w-64 overflow-hidden rounded-full bg-gray-200">
               <div
                 className="h-full rounded-full bg-blue-600 transition-all duration-300"
@@ -277,13 +446,21 @@ export default function Home() {
           </div>
         )}
 
-        {(step === "preview" || step === "done") && (
+        {/* Error */}
+        {error && (
+          <div className="mt-4 rounded-lg bg-red-50 px-4 py-3 text-sm text-red-600">
+            {error}
+          </div>
+        )}
+
+        {/* Step 4: Preview & Edit */}
+        {(step === "preview" || step === "done") && editingColumns.length > 0 && (
           <div>
             <div className="mb-4 flex items-center justify-between">
               <h2 className="text-lg font-semibold text-gray-800">
                 Preview & Edit
               </h2>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 <button
                   onClick={addRow}
                   className="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50"
@@ -316,15 +493,32 @@ export default function Home() {
                 <thead>
                   <tr>
                     <th className="w-8 px-1 py-2"></th>
-                    {editingData[0]?.map((_, c) => (
+                    {editingColumns.map((col, c) => (
                       <th
                         key={c}
                         className="relative px-3 py-2 text-left font-medium text-gray-500"
                       >
                         <div className="flex items-center gap-1">
-                          <span className="text-xs text-gray-400">
-                            Col {c + 1}
-                          </span>
+                          {editingCell?.r === -1 && editingCell?.c === c ? (
+                            <input
+                              autoFocus
+                              className="w-24 border border-blue-400 px-1 text-sm"
+                              value={col}
+                              onChange={(e) => updateColumnName(c, e.target.value)}
+                              onBlur={() => setEditingCell(null)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Escape") setEditingCell(null);
+                                if (e.key === "Enter") setEditingCell(null);
+                              }}
+                            />
+                          ) : (
+                            <span
+                              className="cursor-pointer text-xs text-gray-500 hover:text-blue-600"
+                              onClick={() => setEditingCell({ r: -1, c })}
+                            >
+                              {col}
+                            </span>
+                          )}
                           <button
                             onClick={() => removeColumn(c)}
                             className="text-gray-300 hover:text-red-500"
@@ -350,7 +544,7 @@ export default function Home() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
-                  {editingData.map((row, r) => (
+                  {editingRows.map((row, r) => (
                     <tr key={r} className="hover:bg-gray-50">
                       <td className="px-1 py-1">
                         <button
@@ -385,14 +579,11 @@ export default function Home() {
                         >
                           {editingCell?.r === r && editingCell?.c === c ? (
                             <textarea
-                              ref={textareaRef}
                               autoFocus
                               className="w-full resize-none border-2 border-blue-400 bg-white px-2 py-1 text-sm outline-none"
                               rows={Math.max(2, cell.split("\n").length)}
                               value={cell}
-                              onChange={(e) =>
-                                updateCell(r, c, e.target.value)
-                              }
+                              onChange={(e) => updateCell(r, c, e.target.value)}
                               onBlur={() => setEditingCell(null)}
                               onKeyDown={(e) => {
                                 if (e.key === "Escape") setEditingCell(null);
@@ -400,7 +591,9 @@ export default function Home() {
                             />
                           ) : (
                             <span className="whitespace-pre-wrap text-gray-700">
-                              {cell || <span className="text-gray-300">—</span>}
+                              {cell || (
+                                <span className="text-gray-300">&mdash;</span>
+                              )}
                             </span>
                           )}
                         </td>
@@ -412,13 +605,35 @@ export default function Home() {
             </div>
 
             <p className="mt-3 text-xs text-gray-400">
-              Rows: {editingData.length} · Columns:{" "}
-              {editingData[0]?.length || 0}
-              {" · "}
-              Click a cell to edit · Esc to cancel
+              Rows: {editingRows.length} · Columns: {editingColumns.length} ·
+              Click cell to edit · Esc to cancel
             </p>
           </div>
         )}
+
+        {/* Raw fallback when AI returns no structured data */}
+        {(step === "preview" || step === "done") &&
+          editingColumns.length === 0 &&
+          results.length > 0 && (
+            <div className="mt-6 rounded-xl border border-yellow-200 bg-yellow-50 p-6">
+              <h3 className="mb-2 text-sm font-semibold text-yellow-800">
+                AI could not auto-detect table structure
+              </h3>
+              <p className="mb-3 text-xs text-yellow-600">
+                Raw extraction result is shown below. You can copy and manually
+                structure it.
+              </p>
+              <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-lg bg-white p-4 text-xs text-gray-600">
+                {results.map((r) => r.raw).join("\n\n---\n\n")}
+              </pre>
+              <button
+                onClick={reset}
+                className="mt-4 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm text-gray-600 hover:bg-gray-50"
+              >
+                Try Again
+              </button>
+            </div>
+          )}
       </div>
     </main>
   );
