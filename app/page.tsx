@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect } from "react";
-import { pdfToImages } from "@/lib/pdfToImage";
 import { exportToExcel } from "@/lib/excelExport";
 
 interface PdfFile {
@@ -80,10 +79,17 @@ export default function Home() {
 
       for (let i = 0; i < files.length; i++) {
         const f = files[i];
-        setStatusText(`Converting: ${f.name}`);
+        setStatusText(`Analyzing: ${f.name}`);
         setProgress(Math.round((i / files.length) * 100));
 
-        const { pages } = await pdfToImages(f.file);
+        // Read file as base64 and send directly to backend
+        const buffer = await f.file.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+        let binary = "";
+        for (let j = 0; j < bytes.length; j++) {
+          binary += String.fromCharCode(bytes[j]);
+        }
+        const pdfBase64 = btoa(binary);
 
         setStatusText(`AI analyzing: ${f.name}`);
         setProgress(Math.round(((i + 0.5) / files.length) * 100));
@@ -92,7 +98,7 @@ export default function Home() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            images: pages,
+            pdfBase64,
             instruction: instruction || "Extract all tabular data",
           }),
         });

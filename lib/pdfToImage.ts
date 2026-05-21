@@ -19,9 +19,14 @@ export async function pdfToImages(
   const { getDocument } = await import("pdfjs-dist");
 
   const buffer = await file.arrayBuffer();
-  const pdf = await getDocument({ data: buffer }).promise;
+  const pdf = await getDocument({
+    data: buffer,
+    cMapUrl: "https://cdn.jsdelivr.net/npm/pdfjs-dist@5.7.284/cmaps/",
+    cMapPacked: true,
+    disableFontFace: true, // Force bitmap rendering for CJK fonts
+  }).promise;
 
-  const scale = 2; // 2x for better OCR quality
+  const scale = 2;
   const pages: string[] = [];
 
   for (let i = 1; i <= pdf.numPages; i++) {
@@ -32,7 +37,17 @@ export async function pdfToImages(
     canvas.height = viewport.height;
     const ctx = canvas.getContext("2d")!;
 
-    await page.render({ canvas: canvas, canvasContext: ctx, viewport }).promise;
+    // White background
+    ctx.fillStyle = "white";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    await page.render({
+      canvas,
+      canvasContext: ctx,
+      viewport,
+      background: "white",
+    }).promise;
+
     const base64 = canvas.toDataURL("image/png").split(",")[1];
     pages.push(base64);
   }

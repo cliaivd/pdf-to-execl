@@ -1,137 +1,112 @@
 import { NextRequest, NextResponse } from "next/server";
+import { execSync } from "child_process";
+import { writeFileSync, unlinkSync, mkdirSync, existsSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 
 const DASHSCOPE_KEY = process.env.DASHSCOPE_API_KEY || "";
-const API_BASE = "https://dashscope.aliyuncs.com/api/v1";
+const DASHSCOPE_BASE = "https://dashscope.aliyuncs.com";
 
-const ASSISTANT_ID = "asst_e49f9ada-8dc3-4500-be79-0b81da22bb50";
+function pdfToBase64Png(pdfBase64: string): string[] {
+  const tmpDir = join(tmpdir(), "pdf2img_" + Date.now());
+  mkdirSync(tmpDir, { recursive: true });
 
-async function callAssistant(imageBase64: string, instruction: string) {
-  // 1. Create a thread
-  const threadRes = await fetch(`${API_BASE}/threads`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${DASHSCOPE_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({}),
-  });
-  const thread = await threadRes.json();
-  const threadId = thread.id;
-  if (!threadId) throw new Error("Failed to create thread: " + JSON.stringify(thread));
-
-  // 2. Add message with image
-  const prompt = instruction
-    ? `Extract the following fields from this document image: ${instruction}
-
-Output ONLY valid JSON with "columns" (array of field names) and "rows" (array of arrays of cell values).
-Example: {"columns":["company","date","amount"],"rows":[["ABC Corp","2024-01","100.00"]]}
-No markdown, no extra text. Only the JSON object.`
-    : `Extract ALL tabular data from this document image.
-
-Output ONLY valid JSON with "columns" and "rows".
-No markdown, no extra text. Only the JSON object.`;
-
-  const msgRes = await fetch(`${API_BASE}/threads/${threadId}/messages`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${DASHSCOPE_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      role: "user",
-      content: [
-        { type: "text", text: prompt },
-        {
-          type: "image_url",
-          image_url: { url: `data:image/png;base64,${imageBase64}` },
-        },
-      ],
-    }),
-  });
-  await msgRes.json();
-
-  // 3. Run the assistant
-  const runRes = await fetch(`${API_BASE}/threads/${threadId}/runs`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${DASHSCOPE_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ assistant_id: ASSISTANT_ID }),
-  });
-  const run = await runRes.json();
-  const runId = run.id;
-
-  // 4. Poll until completed
-  let status = "in_progress";
-  let attempts = 0;
-  while (status === "in_progress" || status === "queued") {
-    await new Promise((r) => setTimeout(r, 1000));
-    const pollRes = await fetch(
-      `${API_BASE}/threads/${threadId}/runs/${runId}`,
-      {
-        headers: { Authorization: `Bearer ${DASHSCOPE_KEY}` },
-      }
-    );
-    const poll = await pollRes.json();
-    status = poll.status;
-    attempts++;
-    if (attempts > 60) break; // 60s timeout
-  }
-
-  if (status !== "completed") {
-    throw new Error(`Assistant run failed with status: ${status}`);
-  }
-
-  // 5. Get messages
-  const msgListRes = await fetch(
-    `${API_BASE}/threads/${threadId}/messages`,
-    {
-      headers: { Authorization: `Bearer ${DASHSCOPE_KEY}` },
-    }
-  );
-  const msgList = await msgListRes.json();
-
-  // Find assistant response
-  let content = "";
-  for (const m of msgList.data || []) {
-    if (m.role === "assistant") {
-      for (const c of m.content || []) {
-        if (c.type === "text") {
-          content = c.text?.value || c.text || "";
-        }
-      }
-    }
-    if (content) break;
-  }
-
-  // Parse JSON
-  const trimmed = content.trim();
-  const jsonMatch =
-    trimmed.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/) ||
-    trimmed.match(/\{[\s\S]*"columns"[\s\S]*"rows"[\s\S]*\}/);
-
-  const jsonStr = jsonMatch ? (jsonMatch[1] || jsonMatch[0]).trim() : trimmed;
+  const pdfPath = join(tmpDir, "input.pdf");
+  const pdfBytes = Buffer.from(pdfBase64, "base64");
+  writeFileSync(pdfPath, pdfBytes);
 
   try {
-    const parsed = JSON.parse(jsonStr);
-    return {
-      columns: parsed.columns || [],
-      rows: parsed.rows || [],
-      raw: content,
-    };
-  } catch {
-    return { columns: [], rows: [], raw: content };
+    const script = `
+import fitz, base64, sys, json, os
+
+doc = fitz.open("${pdfPath}")
+result = []
+for i in range(len(doc)):
+    page = doc[i]
+    pix = page.get_pixmap(matrix=fitz.Matrix(2,2))
+    b64 = base64.b64encode(pix.tobytes("png")).decode()
+    result.append(b64)
+doc.close()
+print(json.dumps(result))
+`;
+    const out = execSync(`python3 -c '${script}'`, {
+      encoding: "utf-8",
+      timeout: 30000,
+    });
+    return JSON.parse(out.trim());
+  } finally {
+    // Cleanup
+    try {
+      unlinkSync(pdfPath);
+    } catch {}
   }
+}
+
+async function callQwenVL(imageBase64: string, instruction: string) {
+  const prompt = instruction
+    ? `请从这张图片中提取以下信息：${instruction}\n\n只输出纯 JSON，格式：{"columns":["列名1","列名2",...],"rows":[["值1","值2",...],...]}`
+    : `请从这张图片中提取所有结构化数据，只输出纯 JSON，格式：{"columns":["列名1","列名2",...],"rows":[["值1","值2",...],...]}`;
+
+  const response = await fetch(
+    `${DASHSCOPE_BASE}/compatible-mode/v1/chat/completions`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${DASHSCOPE_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "qwen-vl-plus",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              {
+                type: "image_url",
+                image_url: { url: `data:image/png;base64,${imageBase64}` },
+              },
+            ],
+          },
+        ],
+        temperature: 0.01,
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`API error: ${response.status} - ${err}`);
+  }
+
+  const data = await response.json();
+  let content = data.choices?.[0]?.message?.content || "";
+
+  const cleaned = content
+    .replace(/```(?:json)?\s*/g, "")
+    .replace(/\s*```/g, "")
+    .trim();
+
+  try {
+    const parsed = JSON.parse(cleaned);
+    return { columns: parsed.columns || [], rows: parsed.rows || [] };
+  } catch {
+    const m = cleaned.match(/\{[\s\S]*"columns"[\s\S]*"rows"[\s\S]*\}/);
+    if (m) {
+      try {
+        const parsed = JSON.parse(m[0]);
+        return { columns: parsed.columns || [], rows: parsed.rows || [] };
+      } catch {}
+    }
+  }
+
+  return { columns: [], rows: [], raw: content };
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const { images, instruction } = await request.json();
-
-    if (!images || !Array.isArray(images) || images.length === 0) {
-      return NextResponse.json({ error: "No images provided" }, { status: 400 });
-    }
+    const body = await request.json();
+    const { images, pdfBase64, instruction } = body;
 
     if (!DASHSCOPE_KEY) {
       return NextResponse.json(
@@ -141,9 +116,22 @@ export async function POST(request: NextRequest) {
     }
 
     const results = [];
-    for (let i = 0; i < images.length; i++) {
-      const result = await callAssistant(images[i], instruction || "");
-      results.push({ page: i + 1, ...result });
+
+    if (pdfBase64) {
+      // PDF received - convert to images via Python PyMuPDF
+      const pages = pdfToBase64Png(pdfBase64);
+      for (let i = 0; i < pages.length; i++) {
+        const r = await callQwenVL(pages[i], instruction || "");
+        results.push({ page: i + 1, ...r });
+      }
+    } else if (images?.length) {
+      // Direct image(s) received
+      for (let i = 0; i < images.length; i++) {
+        const r = await callQwenVL(images[i], instruction || "");
+        results.push({ page: i + 1, ...r });
+      }
+    } else {
+      return NextResponse.json({ error: "No PDF or images provided" }, { status: 400 });
     }
 
     return NextResponse.json({ results });
