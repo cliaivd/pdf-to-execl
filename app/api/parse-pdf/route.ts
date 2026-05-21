@@ -39,20 +39,18 @@ export async function POST(request: NextRequest) {
 }
 
 async function callGLM(imageBase64: string, instruction: string) {
-  const systemPrompt = `You are a precise data extraction assistant. Given an image of a document (invoice, table, form, report, etc.), extract all tabular data.
+  const prompt = instruction
+    ? `You are a data extraction tool. Extract the following fields from this document image: ${instruction}
 
-Rules:
-1. Identify column headers from the document
-2. Extract each data row
-3. If the user specifies fields to extract (like "company name, date, amount"), match them exactly
-4. Output ONLY valid JSON in this exact format, with no other text or markdown:
-{"columns":["col1","col2",...],"rows":[["val1","val2",...],...]}
+Output ONLY a markdown table. First row must be the headers. Example:
+| Name | Date | Amount |
+|------|------|--------|
+| ABC  | 2024-01 | $100 |
 
-Keep the original language (Chinese/English etc.) of the document.`;
+No explanations, no extra text. Just the markdown table.`
+    : `You are a data extraction tool. Extract ALL tabular data from this document image.
 
-  const userMessage = instruction
-    ? `Extract the following fields from this document: ${instruction}. Output as JSON with columns and rows.`
-    : "Extract all tabular data from this document image. Output as JSON with columns and rows.";
+Output ONLY a markdown table. First row must be the headers. No explanations.`;
 
   const response = await fetch(`${GLM_BASE}/chat/completions`, {
     method: "POST",
@@ -63,11 +61,10 @@ Keep the original language (Chinese/English etc.) of the document.`;
     body: JSON.stringify({
       model: "glm-4v-flash",
       messages: [
-        { role: "system", content: systemPrompt },
         {
           role: "user",
           content: [
-            { type: "text", text: userMessage },
+            { type: "text", text: prompt },
             {
               type: "image_url",
               image_url: { url: `data:image/png;base64,${imageBase64}` },
@@ -86,24 +83,65 @@ Keep the original language (Chinese/English etc.) of the document.`;
 
   const data = await response.json();
   const content = data.choices?.[0]?.message?.content || "";
+  const parsed = parseMarkdownTable(content);
 
-  // Extract JSON from response (handle markdown code blocks)
-  const jsonMatch =
-    content.match(/```json\n?([\s\S]*?)```/) ||
-    content.match(/\{[\s\S]*"columns"[\s\S]*"rows"[\s\S]*\}/);
+  return { ...parsed, raw: content };
+}
 
-  const jsonStr = jsonMatch
-    ? (jsonMatch[1] || jsonMatch[0]).trim()
-    : content.trim();
+function parseMarkdownTable(text: string): {
+  columns: string[];
+  rows: string[][];
+} {
+  const lines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
 
-  try {
-    const parsed = JSON.parse(jsonStr);
-    return {
-      columns: parsed.columns || [],
-      rows: parsed.rows || [],
-      raw: content,
-    };
-  } catch {
-    return { columns: [], rows: [], raw: content };
+  // Find the first markdown table (lines starting with |)
+  const tableLines = lines.filter(
+    (l) => l.startsWith("|") && l.endsWith("|")
+  );
+
+  if (tableLines.length < 2) {
+    // No markdown table found; try to find any structured text
+    return { columns: [], rows: [] };
   }
+
+  // Skip separator line (|---|---|)
+  const dataLines = tableLines.filter(
+    (l) => !l.match(/^\|[\s\-:]+\|/)
+  );
+
+  if (dataLines.length === 0) return { columns: [], rows: [] };
+
+  const headers = parseTableRow(dataLines[0]);
+
+  if (headers.length === 0) return { columns: [], rows: [] };
+
+  // If headers contain only empty/placeholder text, use generic names
+  const hasRealHeaders = headers.some(
+    (h) => h && h !== " " && !h.match(/^(col|column|header)/i)
+  );
+
+  const columnNames = hasRealHeaders
+    ? headers
+    : headers.map((_, i) => `Column ${i + 1}`);
+
+  const rows = dataLines.slice(1).map((l) => {
+    const cells = parseTableRow(l);
+    // Pad or trim to match column count
+    while (cells.length < columnNames.length) cells.push("");
+    return cells.slice(0, columnNames.length);
+  });
+
+  return { columns: columnNames, rows };
+}
+
+function parseTableRow(line: string): string[] {
+  // Remove leading/trailing pipe, split by pipe, trim each cell
+  return line
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
 }

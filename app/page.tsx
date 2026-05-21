@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { pdfToImages } from "@/lib/pdfToImage";
 import { exportToExcel } from "@/lib/excelExport";
 
@@ -24,7 +24,7 @@ export default function Home() {
   const [dragging, setDragging] = useState(false);
   const [step, setStep] = useState<Step>("upload");
   const [instruction, setInstruction] = useState(
-    "请提取发票中的以下字段：公司名称、开票日期、发票号码、金额（含税）、税额、购方名称"
+    "Extract all table data from this document, including headers. Output as markdown table."
   );
   const [editingInstruction, setEditingInstruction] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -34,6 +34,7 @@ export default function Home() {
   const [editingRows, setEditingRows] = useState<string[][]>([]);
   const [editingCell, setEditingCell] = useState<{ r: number; c: number } | null>(null);
   const [error, setError] = useState("");
+  const [rawModeText, setRawModeText] = useState("");
 
   const addFiles = useCallback((fileList: FileList | File[]) => {
     const pdfs = Array.from(fileList).filter(
@@ -75,28 +76,24 @@ export default function Home() {
     setResults([]);
 
     try {
+      const allResults: ParseResult[] = [];
+
       for (let i = 0; i < files.length; i++) {
         const f = files[i];
         setStatusText(`Converting: ${f.name}`);
         setProgress(Math.round((i / files.length) * 100));
 
-        // Step 1: PDF → images
         const { pages } = await pdfToImages(f.file);
 
         setStatusText(`AI analyzing: ${f.name}`);
-        setProgress(
-          Math.round(((i + 0.5) / files.length) * 100)
-        );
+        setProgress(Math.round(((i + 0.5) / files.length) * 100));
 
-        // Step 2: Send to AI via API
         const res = await fetch("/api/parse-pdf", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             images: pages,
-            instruction:
-              instruction ||
-              "Extract all tabular data from this document.",
+            instruction: instruction || "Extract all tabular data",
           }),
         });
 
@@ -106,62 +103,81 @@ export default function Home() {
         }
 
         const data = await res.json();
-        setResults((prev) => [...prev, ...data.results]);
+        allResults.push(...data.results);
       }
 
-      // Combine all results
-      const allColumns =
-        results.length > 0
-          ? results[0].columns
-          : ([] as string[]);
-      const allRows = results.flatMap((r) => r.rows);
+      setResults(allResults);
 
-      // Also add newly fetched results
-      const freshColumns =
-        results.length > 0
-          ? [...results[0].columns]
-          : [];
-      const freshRows = results.flatMap((r) => r.rows);
+      // Process results: use first file's structure
+      const cols = allResults[0]?.columns || [];
+      const rows = allResults.flatMap((r) => r.rows || []);
 
-      // Re-fetch from the state after all processing
-      // (useEffect-like recalculation)
-      setEditingColumns(freshColumns);
-      setEditingRows(freshRows);
-      setProgress(100);
-      setStatusText("Done!");
-      setStep("preview");
+      if (cols.length > 0) {
+        setEditingColumns(cols);
+        setEditingRows(rows);
+        setProgress(100);
+        setStatusText("Done!");
+        setStep("preview");
+      } else {
+        // No structured data — show raw text
+        setRawModeText(allResults.map((r) => r.raw).join("\n\n---\n\n"));
+        setProgress(100);
+        setStatusText("Done!");
+        setStep("preview");
+      }
     } catch (err: any) {
       setError(err?.message || "Something went wrong");
       setStep("config");
     }
   };
 
-  // Process results after state is set
-  // Use a ref to track if we should combine results
-  const processResults = useCallback((allResults: ParseResult[]) => {
-    if (allResults.length === 0) return;
-    const cols = allResults[0].columns || [];
-    const rows = allResults.flatMap((r) => r.rows || []);
-    setEditingColumns(cols);
-    setEditingRows(rows);
-    setStep("preview");
-  }, []);
+  // Handle raw text → table conversion
+  const applyRawText = () => {
+    const rows = rawModeText
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && !l.startsWith("---"));
 
-  // Watch results changes
-  const prevResultsLength = useRef(0);
-  if (results.length > 0 && results.length !== prevResultsLength.current) {
-    prevResultsLength.current = results.length;
-    // Only trigger when we finish all files
-    if (step === "processing") {
-      const cols = results[0].columns || [];
-      const rows = results.flatMap((r) => r.rows || []);
-      setEditingColumns(cols);
-      setEditingRows(rows);
-      setProgress(100);
-      setStatusText("Done!");
-      setTimeout(() => setStep("preview"), 300);
+    if (rows.length === 0) return;
+
+    // Try to split by common delimiters
+    const hasPipe = rows.some((r) => r.startsWith("|"));
+    const hasTab = rows.some((r) => r.includes("\t"));
+    const hasComma = rows.some((r) => r.includes(","));
+
+    let parsed: string[][];
+
+    if (hasPipe) {
+      parsed = rows
+        .filter((l) => l.startsWith("|"))
+        .filter((l) => !l.match(/^\|[\s\-:]+\|$/)) // skip separator
+        .map((l) =>
+          l
+            .replace(/^\|/, "")
+            .replace(/\|$/, "")
+            .split("|")
+            .map((c) => c.trim())
+        );
+    } else if (hasTab) {
+      parsed = rows.map((l) => l.split("\t").map((c) => c.trim()));
+    } else if (hasComma) {
+      parsed = rows.map((l) => l.split(",").map((c) => c.trim()));
+    } else {
+      // Single column
+      parsed = rows.map((l) => [l]);
     }
-  }
+
+    if (parsed.length > 0) {
+      // Max column count determines structure
+      const maxCols = Math.max(...parsed.map((r) => r.length));
+      const normalized = parsed.map((r) => {
+        while (r.length < maxCols) r.push("");
+        return r.slice(0, maxCols);
+      });
+      setEditingColumns(normalized[0]);
+      setEditingRows(normalized.slice(1));
+    }
+  };
 
   const handleExport = () => {
     const name =
@@ -215,7 +231,7 @@ export default function Home() {
     setEditingColumns([]);
     setEditingRows([]);
     setError("");
-    prevResultsLength.current = 0;
+    setRawModeText("");
   };
 
   const formatSize = (bytes: number) => {
@@ -230,8 +246,7 @@ export default function Home() {
         <header className="mb-8 text-center">
           <h1 className="text-3xl font-bold text-gray-800">PDF → Excel</h1>
           <p className="mt-1 text-sm text-gray-500">
-            Upload PDF &rarr; AI extracts data &rarr; Edit &rarr; Export to
-            Excel
+            Upload PDF &rarr; AI extracts data &rarr; Edit &rarr; Export Excel
           </p>
         </header>
 
@@ -332,17 +347,13 @@ export default function Home() {
           </>
         )}
 
-        {/* Step 2: Configure extraction */}
+        {/* Step 2: Configure */}
         {(step === "config" || (files.length > 0 && step === "upload")) &&
           files.length > 0 && (
             <div className="mt-6 rounded-xl border border-gray-200 bg-white p-6 shadow-sm">
               <h2 className="mb-3 text-sm font-semibold text-gray-700">
-                Extraction Instructions
+                Tell AI what to extract
               </h2>
-              <p className="mb-2 text-xs text-gray-400">
-                Tell the AI what data to extract. Be specific about fields and
-                format.
-              </p>
 
               {editingInstruction ? (
                 <textarea
@@ -358,11 +369,7 @@ export default function Home() {
                   className="cursor-pointer rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm text-gray-600 hover:border-gray-300"
                   onClick={() => setEditingInstruction(true)}
                 >
-                  {instruction || (
-                    <span className="italic text-gray-400">
-                      Click to enter instructions...
-                    </span>
-                  )}
+                  {instruction || "Click to enter instructions..."}
                   <svg
                     className="ml-2 inline-block h-3 w-3 text-gray-400"
                     fill="none"
@@ -379,52 +386,48 @@ export default function Home() {
                 </div>
               )}
 
-              <div className="mt-4 flex gap-2">
+              <div className="mt-4 flex flex-wrap gap-2">
                 <button
                   onClick={() => setInstruction("")}
                   className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-50"
                 >
                   Clear
                 </button>
-
                 <button
                   onClick={() =>
                     setInstruction(
-                      "请提取发票中的以下字段：公司名称、开票日期、发票号码、金额（含税）、税额、购方名称"
+                      "Extract invoice fields: company name, invoice date, invoice number, total amount (tax included), tax amount, buyer name"
                     )
                   }
                   className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-50"
                 >
-                  Invoice template
+                  Invoice
                 </button>
-
                 <button
                   onClick={() =>
                     setInstruction(
-                      "请提取表格中的所有数据，保留所有列和行"
+                      "Extract all table data with headers from this document. Output as markdown table."
                     )
                   }
                   className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-50"
                 >
-                  Table template
+                  Generic table
                 </button>
-
                 <button
                   onClick={() => setStep("config")}
-                  className="ml-auto rounded-lg bg-blue-600 px-6 py-2 text-sm font-semibold text-white shadow transition hover:bg-blue-700"
+                  className="ml-auto rounded-lg bg-blue-600 px-6 py-2 text-sm font-semibold text-white hover:bg-blue-700"
                 >
-                  Start Extraction
+                  Next: Configure
                 </button>
               </div>
             </div>
           )}
 
-        {/* Hidden start button inside config */}
         {step === "config" && (
           <div className="mt-4 text-center">
             <button
               onClick={handleStartParse}
-              className="rounded-lg bg-blue-600 px-8 py-3 text-base font-semibold text-white shadow transition hover:bg-blue-700"
+              className="rounded-lg bg-blue-600 px-8 py-3 text-base font-semibold text-white shadow hover:bg-blue-700"
             >
               Start AI Extraction
             </button>
@@ -453,7 +456,7 @@ export default function Home() {
           </div>
         )}
 
-        {/* Step 4: Preview & Edit */}
+        {/* Step 4a: Preview with structured table */}
         {(step === "preview" || step === "done") && editingColumns.length > 0 && (
           <div>
             <div className="mb-4 flex items-center justify-between">
@@ -461,30 +464,12 @@ export default function Home() {
                 Preview & Edit
               </h2>
               <div className="flex flex-wrap gap-2">
-                <button
-                  onClick={addRow}
-                  className="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50"
-                >
-                  + Row
-                </button>
-                <button
-                  onClick={addColumn}
-                  className="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50"
-                >
-                  + Column
-                </button>
-                <button
-                  onClick={handleExport}
-                  className="rounded-lg bg-green-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-green-700"
-                >
+                <button onClick={addRow} className="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50">+ Row</button>
+                <button onClick={addColumn} className="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50">+ Column</button>
+                <button onClick={handleExport} className="rounded-lg bg-green-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-green-700">
                   {step === "done" ? "✅ Exported" : "Export to Excel"}
                 </button>
-                <button
-                  onClick={reset}
-                  className="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50"
-                >
-                  Start Over
-                </button>
+                <button onClick={reset} className="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50">Start Over</button>
               </div>
             </div>
 
@@ -494,49 +479,15 @@ export default function Home() {
                   <tr>
                     <th className="w-8 px-1 py-2"></th>
                     {editingColumns.map((col, c) => (
-                      <th
-                        key={c}
-                        className="relative px-3 py-2 text-left font-medium text-gray-500"
-                      >
+                      <th key={c} className="relative px-3 py-2 text-left font-medium text-gray-500">
                         <div className="flex items-center gap-1">
                           {editingCell?.r === -1 && editingCell?.c === c ? (
-                            <input
-                              autoFocus
-                              className="w-24 border border-blue-400 px-1 text-sm"
-                              value={col}
-                              onChange={(e) => updateColumnName(c, e.target.value)}
-                              onBlur={() => setEditingCell(null)}
-                              onKeyDown={(e) => {
-                                if (e.key === "Escape") setEditingCell(null);
-                                if (e.key === "Enter") setEditingCell(null);
-                              }}
-                            />
+                            <input autoFocus className="w-24 border border-blue-400 px-1 text-sm" value={col} onChange={(e) => updateColumnName(c, e.target.value)} onBlur={() => setEditingCell(null)} onKeyDown={(e) => { if (e.key === "Escape" || e.key === "Enter") setEditingCell(null); }} />
                           ) : (
-                            <span
-                              className="cursor-pointer text-xs text-gray-500 hover:text-blue-600"
-                              onClick={() => setEditingCell({ r: -1, c })}
-                            >
-                              {col}
-                            </span>
+                            <span className="cursor-pointer text-xs text-gray-500 hover:text-blue-600" onClick={() => setEditingCell({ r: -1, c })}>{col}</span>
                           )}
-                          <button
-                            onClick={() => removeColumn(c)}
-                            className="text-gray-300 hover:text-red-500"
-                            aria-label="Remove column"
-                          >
-                            <svg
-                              className="h-3 w-3"
-                              fill="none"
-                              stroke="currentColor"
-                              viewBox="0 0 24 24"
-                            >
-                              <path
-                                strokeLinecap="round"
-                                strokeLinejoin="round"
-                                strokeWidth={2}
-                                d="M6 18L18 6M6 6l12 12"
-                              />
-                            </svg>
+                          <button onClick={() => removeColumn(c)} className="text-gray-300 hover:text-red-500" aria-label="Remove column">
+                            <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                           </button>
                         </div>
                       </th>
@@ -547,54 +498,16 @@ export default function Home() {
                   {editingRows.map((row, r) => (
                     <tr key={r} className="hover:bg-gray-50">
                       <td className="px-1 py-1">
-                        <button
-                          onClick={() => removeRow(r)}
-                          className="text-gray-300 hover:text-red-500"
-                          aria-label="Remove row"
-                        >
-                          <svg
-                            className="h-3.5 w-3.5"
-                            fill="none"
-                            stroke="currentColor"
-                            viewBox="0 0 24 24"
-                          >
-                            <path
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              strokeWidth={2}
-                              d="M6 18L18 6M6 6l12 12"
-                            />
-                          </svg>
+                        <button onClick={() => removeRow(r)} className="text-gray-300 hover:text-red-500" aria-label="Remove row">
+                          <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                         </button>
                       </td>
                       {row.map((cell, c) => (
-                        <td
-                          key={c}
-                          className={`cursor-pointer px-3 py-2 ${
-                            editingCell?.r === r && editingCell?.c === c
-                              ? "p-0"
-                              : ""
-                          }`}
-                          onClick={() => setEditingCell({ r, c })}
-                        >
+                        <td key={c} className={`cursor-pointer px-3 py-2 ${editingCell?.r === r && editingCell?.c === c ? "p-0" : ""}`} onClick={() => setEditingCell({ r, c })}>
                           {editingCell?.r === r && editingCell?.c === c ? (
-                            <textarea
-                              autoFocus
-                              className="w-full resize-none border-2 border-blue-400 bg-white px-2 py-1 text-sm outline-none"
-                              rows={Math.max(2, cell.split("\n").length)}
-                              value={cell}
-                              onChange={(e) => updateCell(r, c, e.target.value)}
-                              onBlur={() => setEditingCell(null)}
-                              onKeyDown={(e) => {
-                                if (e.key === "Escape") setEditingCell(null);
-                              }}
-                            />
+                            <textarea autoFocus className="w-full resize-none border-2 border-blue-400 bg-white px-2 py-1 text-sm outline-none" rows={Math.max(2, cell.split("\n").length)} value={cell} onChange={(e) => updateCell(r, c, e.target.value)} onBlur={() => setEditingCell(null)} onKeyDown={(e) => { if (e.key === "Escape") setEditingCell(null); }} />
                           ) : (
-                            <span className="whitespace-pre-wrap text-gray-700">
-                              {cell || (
-                                <span className="text-gray-300">&mdash;</span>
-                              )}
-                            </span>
+                            <span className="whitespace-pre-wrap text-gray-700">{cell || <span className="text-gray-300">&mdash;</span>}</span>
                           )}
                         </td>
                       ))}
@@ -603,35 +516,46 @@ export default function Home() {
                 </tbody>
               </table>
             </div>
-
-            <p className="mt-3 text-xs text-gray-400">
-              Rows: {editingRows.length} · Columns: {editingColumns.length} ·
-              Click cell to edit · Esc to cancel
-            </p>
+            <p className="mt-3 text-xs text-gray-400">Rows: {editingRows.length} · Columns: {editingColumns.length} · Click cell to edit · Esc to cancel</p>
           </div>
         )}
 
-        {/* Raw fallback when AI returns no structured data */}
+        {/* Step 4b: Raw text fallback */}
         {(step === "preview" || step === "done") &&
           editingColumns.length === 0 &&
           results.length > 0 && (
             <div className="mt-6 rounded-xl border border-yellow-200 bg-yellow-50 p-6">
               <h3 className="mb-2 text-sm font-semibold text-yellow-800">
-                AI could not auto-detect table structure
+                AI Response Received — Not Auto-Formatted
               </h3>
               <p className="mb-3 text-xs text-yellow-600">
-                Raw extraction result is shown below. You can copy and manually
-                structure it.
+                The AI returned text instead of a structured table. You can either edit the text below and click &quot;Apply as Table&quot;, or go back and refine your instructions.
               </p>
-              <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-lg bg-white p-4 text-xs text-gray-600">
-                {results.map((r) => r.raw).join("\n\n---\n\n")}
-              </pre>
-              <button
-                onClick={reset}
-                className="mt-4 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm text-gray-600 hover:bg-gray-50"
-              >
-                Try Again
-              </button>
+
+              <textarea
+                className="w-full rounded-lg border border-gray-300 p-3 text-xs font-mono"
+                rows={12}
+                value={rawModeText}
+                onChange={(e) => setRawModeText(e.target.value)}
+              />
+
+              <div className="mt-3 flex gap-2">
+                <button
+                  onClick={applyRawText}
+                  className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700"
+                >
+                  Apply as Table
+                </button>
+                <button
+                  onClick={reset}
+                  className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm text-gray-600 hover:bg-gray-50"
+                >
+                  Start Over
+                </button>
+              </div>
+              <p className="mt-2 text-xs text-gray-400">
+                Tip: Use | pipes or paste comma/tab-separated data. First row becomes column headers.
+              </p>
             </div>
           )}
       </div>
