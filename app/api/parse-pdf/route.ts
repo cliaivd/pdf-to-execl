@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const GLM_API_KEY = process.env.GLM_API_KEY || "";
-const GLM_BASE = "https://open.bigmodel.cn/api/paas/v4";
+const DASHSCOPE_KEY = process.env.DASHSCOPE_API_KEY || "";
+const DASHSCOPE_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 
 export async function POST(request: NextRequest) {
   try {
@@ -14,9 +14,9 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    if (!GLM_API_KEY) {
+    if (!DASHSCOPE_KEY) {
       return NextResponse.json(
-        { error: "GLM_API_KEY not configured" },
+        { error: "DASHSCOPE_API_KEY not configured" },
         { status: 500 }
       );
     }
@@ -24,7 +24,7 @@ export async function POST(request: NextRequest) {
     const results = [];
 
     for (let i = 0; i < images.length; i++) {
-      const result = await callGLM(images[i], instruction);
+      const result = await callQwenVL(images[i], instruction);
       results.push({ page: i + 1, ...result });
     }
 
@@ -38,28 +38,31 @@ export async function POST(request: NextRequest) {
   }
 }
 
-async function callGLM(imageBase64: string, instruction: string) {
+async function callQwenVL(imageBase64: string, instruction: string) {
   const prompt = instruction
-    ? `You are a data extraction tool. Extract the following fields from this document image: ${instruction}
+    ? `Extract the following fields from this document image: ${instruction}
 
-Output ONLY a markdown table. First row must be the headers. Example:
-| Name | Date | Amount |
-|------|------|--------|
-| ABC  | 2024-01 | $100 |
+You MUST output ONLY a valid JSON object with two keys: "columns" (array of column names) and "rows" (array of arrays of cell values).
+No markdown, no code blocks, no explanations. ONLY the JSON.
 
-No explanations, no extra text. Just the markdown table.`
-    : `You are a data extraction tool. Extract ALL tabular data from this document image.
+Example for an invoice: {"columns":["company","date","amount"],"rows":[["ABC Corp","2024-01-15","$100"]]}
 
-Output ONLY a markdown table. First row must be the headers. No explanations.`;
+If no data is found, return: {"columns":[],"rows":[]}`
+    : `Extract ALL tabular data from this document image.
 
-  const response = await fetch(`${GLM_BASE}/chat/completions`, {
+You MUST output ONLY a valid JSON object with two keys: "columns" and "rows".
+No markdown, no code blocks, no explanations. ONLY the JSON.
+
+If no data is found, return: {"columns":[],"rows":[]}`;
+
+  const response = await fetch(`${DASHSCOPE_BASE}/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${GLM_API_KEY}`,
+      Authorization: `Bearer ${DASHSCOPE_KEY}`,
     },
     body: JSON.stringify({
-      model: "glm-4v-flash",
+      model: "qwen-vl-plus",
       messages: [
         {
           role: "user",
@@ -72,76 +75,44 @@ Output ONLY a markdown table. First row must be the headers. No explanations.`;
           ],
         },
       ],
-      temperature: 0.1,
+      temperature: 0.01,
     }),
   });
 
   if (!response.ok) {
     const err = await response.text();
-    throw new Error(`GLM API error: ${response.status} - ${err}`);
+    throw new Error(`Qwen-VL API error: ${response.status} - ${err}`);
   }
 
   const data = await response.json();
-  const content = data.choices?.[0]?.message?.content || "";
-  const parsed = parseMarkdownTable(content);
+  let content = data.choices?.[0]?.message?.content || "";
 
-  return { ...parsed, raw: content };
-}
+  // Aggressive JSON extraction
+  // 1. Try full content as JSON
+  try {
+    const parsed = JSON.parse(content.trim());
+    if (parsed.columns !== undefined) {
+      return { columns: parsed.columns || [], rows: parsed.rows || [], raw: content };
+    }
+  } catch {}
 
-function parseMarkdownTable(text: string): {
-  columns: string[];
-  rows: string[][];
-} {
-  const lines = text
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
-
-  // Find the first markdown table (lines starting with |)
-  const tableLines = lines.filter(
-    (l) => l.startsWith("|") && l.endsWith("|")
-  );
-
-  if (tableLines.length < 2) {
-    // No markdown table found; try to find any structured text
-    return { columns: [], rows: [] };
+  // 2. Markdown code block
+  const blockMatch = content.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+  if (blockMatch) {
+    try {
+      const parsed = JSON.parse(blockMatch[1].trim());
+      return { columns: parsed.columns || [], rows: parsed.rows || [], raw: content };
+    } catch {}
   }
 
-  // Skip separator line (|---|---|)
-  const dataLines = tableLines.filter(
-    (l) => !l.match(/^\|[\s\-:]+\|/)
-  );
+  // 3. Any JSON with columns
+  const jsonMatch = content.match(/\{[\s\S]*?"columns"[\s\S]*?"rows"[\s\S]*?\}/);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]);
+      return { columns: parsed.columns || [], rows: parsed.rows || [], raw: content };
+    } catch {}
+  }
 
-  if (dataLines.length === 0) return { columns: [], rows: [] };
-
-  const headers = parseTableRow(dataLines[0]);
-
-  if (headers.length === 0) return { columns: [], rows: [] };
-
-  // If headers contain only empty/placeholder text, use generic names
-  const hasRealHeaders = headers.some(
-    (h) => h && h !== " " && !h.match(/^(col|column|header)/i)
-  );
-
-  const columnNames = hasRealHeaders
-    ? headers
-    : headers.map((_, i) => `Column ${i + 1}`);
-
-  const rows = dataLines.slice(1).map((l) => {
-    const cells = parseTableRow(l);
-    // Pad or trim to match column count
-    while (cells.length < columnNames.length) cells.push("");
-    return cells.slice(0, columnNames.length);
-  });
-
-  return { columns: columnNames, rows };
-}
-
-function parseTableRow(line: string): string[] {
-  // Remove leading/trailing pipe, split by pipe, trim each cell
-  return line
-    .replace(/^\|/, "")
-    .replace(/\|$/, "")
-    .split("|")
-    .map((cell) => cell.trim());
+  return { columns: [], rows: [], raw: content };
 }
